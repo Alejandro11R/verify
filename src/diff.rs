@@ -13,6 +13,8 @@ pub fn parse_unified_diff(raw: &str) -> Result<Vec<AddedLine>, String> {
     let mut is_new_file = false;
     let mut skip_file = false;
     let mut plus_without_path = false;
+    let mut in_hunk = false;
+    let mut hunk_lines_left: usize = 0;
 
     for raw_line in raw.split_inclusive('\n') {
         let line = raw_line.trim_end_matches(['\n', '\r']);
@@ -20,6 +22,8 @@ pub fn parse_unified_diff(raw: &str) -> Result<Vec<AddedLine>, String> {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             skip_file = false;
             is_new_file = false;
+            in_hunk = false;
+            hunk_lines_left = 0;
             path = parse_git_dst(rest).unwrap_or_default();
             continue;
         }
@@ -44,7 +48,7 @@ pub fn parse_unified_diff(raw: &str) -> Result<Vec<AddedLine>, String> {
             skip_file = true;
             continue;
         }
-        if is_plus_file_header(line) {
+        if !in_hunk && is_plus_file_header(line) {
             let rest = line[3..].trim_start();
             let rest = cut_tab(rest);
             if rest != "/dev/null" {
@@ -60,8 +64,24 @@ pub fn parse_unified_diff(raw: &str) -> Result<Vec<AddedLine>, String> {
         }
         if let Some(rest) = line.strip_prefix("@@ ") {
             new_line = parse_hunk_new_start(rest).unwrap_or(0);
+            hunk_lines_left = parse_hunk_added_count(rest);
+            in_hunk = hunk_lines_left > 0;
             continue;
         }
+
+        if in_hunk {
+            let is_plus = line.starts_with('+');
+            let is_context = line.starts_with(' ') || line.is_empty();
+            if is_plus || is_context {
+                if hunk_lines_left > 0 {
+                    hunk_lines_left -= 1;
+                }
+                if hunk_lines_left == 0 {
+                    in_hunk = false;
+                }
+            }
+        }
+
         if line.starts_with('+') {
             let text = line[1..].to_string();
             if path.is_empty() {
@@ -254,6 +274,19 @@ fn parse_hunk_new_start(rest: &str) -> Option<usize> {
     num.parse().ok()
 }
 
+fn parse_hunk_added_count(rest: &str) -> usize {
+    let Some(plus_part) = rest.split_whitespace().find(|p| p.starts_with('+')) else {
+        return 0;
+    };
+    let mut parts = plus_part.trim_start_matches('+').split(',');
+    parts.next(); // skip line number
+    if let Some(count_str) = parts.next() {
+        count_str.parse().unwrap_or(0)
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +463,158 @@ diff --git a/.env b/.env
         let lines = parse(diff);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text, "SECRET=foobar");
+    }
+
+
+    #[test]
+    fn spoof_plus_plus_in_hunk_does_not_change_path() {
+        let diff = "\
+diff --git a/src/test.rs b/src/test.rs
+--- a/src/test.rs
++++ b/src/test.rs
+@@ -1,0 +1,3 @@
++let fake = r#\"
++++ b/node_modules/bypass
++let secret = \"AKIAIOSFODNN7EXAMPLE\";
+";
+        let lines = parse(diff);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].path, "src/test.rs");
+        assert_eq!(lines[1].path, "src/test.rs");
+        assert_eq!(lines[1].text, "++ b/node_modules/bypass");
+        assert_eq!(lines[2].path, "src/test.rs");
+        assert!(lines[2].text.contains("AKIA"));
+    }
+
+    #[test]
+    fn multiple_files_reset_hunk_state() {
+        let diff = "\
+diff --git a/file1 b/file1
+--- a/file1
++++ b/file1
+@@ -1 +1 @@
++one
+diff --git a/file2 b/file2
+--- a/file2
++++ b/file2
+@@ -1 +1 @@
++two
+";
+        let lines = parse(diff);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].path, "file1");
+        assert_eq!(lines[0].text, "one");
+        assert_eq!(lines[1].path, "file2");
+        assert_eq!(lines[1].text, "two");
+    }
+
+    #[test]
+    fn multiple_hunks_retain_hunk_state() {
+        let diff = "\
+diff --git a/f b/f
+--- a/f
++++ b/f
+@@ -1 +1 @@
++first
+@@ -10 +10 @@
++++ b/ignore
++second
+";
+        let lines = parse(diff);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].path, "f");
+        assert_eq!(lines[1].path, "f");
+        assert_eq!(lines[1].text, "++ b/ignore");
+        assert_eq!(lines[2].path, "f");
+        assert_eq!(lines[2].text, "second");
+    }
+
+    #[test]
+    fn generic_unified_diff_multiple_files() {
+        let diff = "\
+--- old1
++++ new1
+@@ -1 +1 @@
++a
+--- old2
++++ new2
+@@ -1 +1 @@
++b
+";
+        let lines = parse(diff);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].path, "new1");
+        assert_eq!(lines[0].text, "a");
+        assert_eq!(lines[1].path, "new2");
+        assert_eq!(lines[1].text, "b");
+    }
+
+    #[test]
+    fn generic_unified_diff_secret_after_file_change() {
+        let diff = "\
+--- node_modules/bypass/old.js
++++ node_modules/bypass/new.js
+@@ -1 +1 @@
++safe
+--- src/main.rs
++++ src/main.rs
+@@ -1 +1 @@
++secret
+";
+        let lines = parse(diff);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].path, "node_modules/bypass/new.js");
+        assert_eq!(lines[1].path, "src/main.rs");
+        assert_eq!(lines[1].text, "secret");
+    }
+
+    #[test]
+    fn generic_unified_diff_new_file() {
+        let diff = "\
+--- /dev/null
++++ b/src/new.rs
+@@ -0,0 +1 @@
++hello
+";
+        let lines = parse(diff);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].path, "src/new.rs");
+    }
+
+    #[test]
+    fn generic_unified_diff_deleted_file() {
+        let diff = "\
+--- a/gone.rs
++++ /dev/null
+@@ -1 +0,0 @@
+-secret
+";
+        let lines = parse(diff);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn combined_spoofing_and_generic_unified_diff() {
+        let diff = "\
+--- a/file1
++++ b/file1
+@@ -1,2 +1,3 @@
+ context
++++ b/bypass
++secret1
+--- a/file2
++++ b/file2
+@@ -10,2 +10,2 @@
+-old
++secret2
+";
+        let lines = parse(diff);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].path, "file1");
+        assert_eq!(lines[0].text, "++ b/bypass");
+        assert_eq!(lines[1].path, "file1");
+        assert_eq!(lines[1].text, "secret1");
+        assert_eq!(lines[2].path, "file2");
+        assert_eq!(lines[2].text, "secret2");
     }
 }
