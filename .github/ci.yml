@@ -124,5 +124,20 @@ jobs:
             macOS: `verify-aarch64-apple-darwin`.
             
             Este Release *es* la distribución de V1.
+
+            ### Prueba de concepto
+            Comprueba su funcionamiento creando un secreto:
+            ```bash
+            echo "PASSWORD=rotated-secret-99" > .env
+            git add .env
+            git commit -m x
+            ```
+            (El commit será bloqueado de inmediato).
+
+            ### Límites conocidos
+            Para realizar un bypass intencional en caso de emergencia y poder rotar secretos, usa la bandera nativa de Git:
+            ```bash
+            git commit -m "Rotar secretos" --no-verify
+            ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
